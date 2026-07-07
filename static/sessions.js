@@ -674,6 +674,11 @@ function _scheduleActiveSessionIdleReload(sid) {
   if(!sid) return;
   setTimeout(async () => {
     if(!S||!S.session||S.session.session_id !== sid) return;
+    // #5409: skip idle reload while any loadSession() is in flight — avoids
+    // a race where the idle reload overwrites _loadingSessionId and silently
+    // cancels an in-progress session switch (most visible on iOS PWA with
+    // large sessions where Phase 1 metadata fetch is slow).
+    if(typeof _loadingSessionId !== 'undefined' && _loadingSessionId) return;
     if(S.busy || S.activeStreamId) return;
     if(typeof _isMessageReaderUnpinned==='function'&&_isMessageReaderUnpinned()){
       _deferActiveSessionExternalRefresh('idle-reconcile');
@@ -1237,7 +1242,8 @@ async function newSession(flash, options={}){
       const _dirP=loadDir('.');
       if(_dirP&&typeof _dirP.catch==='function') _dirP.catch(()=>{});
     }
-    // don't call renderSessionList here - callers do it when needed
+    // Refresh sidebar to include the newly created session (#3874).
+    if(typeof refreshSessionList==='function'){Promise.resolve(refreshSessionList('new-session')).catch(()=>{})}
   })();
   try{
     return await _newSessionInFlight;
@@ -1316,6 +1322,7 @@ async function loadSession(sid){
   // Mark this session as the in-flight load. Subsequent loadSession() calls
   // will overwrite this; stale awaits use the mismatch to bail out (#1060).
   _loadingSessionId = sid;
+  if(currentSid!==sid&&typeof _uploadPendingFilesSyncProgressForSession==='function')_uploadPendingFilesSyncProgressForSession(sid);
   // Reset scroll state for fresh session navigation — the reader expects to
   // land at the bottom of the new transcript, not wherever a stale unpin flag
   // from a prior session or a stray touch event during loading would place them.
@@ -2004,6 +2011,16 @@ async function _openSidebarSession(session, loadOpts={}){
 
 function _isReadOnlySession(session) {
   return !!(session && (session.read_only || session.is_read_only));
+}
+
+function _isBranchableReadOnlySession(session) {
+  if (!_isReadOnlySession(session)) return false;
+  const sources = [
+    session && session.source_tag,
+    session && session.raw_source,
+    session && session.source,
+  ].map(v => String(v || '').trim().toLowerCase());
+  return sources.includes('cron');
 }
 
 function _sourceKeyForSession(session) {
@@ -4251,6 +4268,17 @@ function _invalidateSessionListRenders(){
   _renderSessionListGen++;
   _pendingSessionListPayload = null;
   _renderSessionListQueuedRequest = null;
+  // A retry whose fetch is invalidated here (e.g. a profile switch mid-retry)
+  // would otherwise leave the error note stuck as an inert "Retrying…" button
+  // with no request in flight — the stale fetch returns before
+  // _showSessionListLoadError and the .finally() bails when the old button was
+  // removed. Clear the pending retry markers so the next repaint shows an
+  // actionable idle Retry again.
+  if(_sessionListLoadError && (_sessionListLoadError.retrying || _sessionListLoadError._retryFailedFocus)){
+    _sessionListLoadError = {..._sessionListLoadError};
+    delete _sessionListLoadError.retrying;
+    delete _sessionListLoadError._retryFailedFocus;
+  }
 }
 if(typeof window!=='undefined') window._invalidateSessionListRenders = _invalidateSessionListRenders;
 
@@ -4663,6 +4691,10 @@ function _mergeRenderSessionListOptions(prev, next){
 function _showSessionListLoadError(error){
   console.warn('renderSessionList',error);
   const isTimeout=Boolean(error&&(error.timeout===true||error.name==='TimeoutError'));
+  // If this error is landing while a retry was in flight, flag the fresh Retry
+  // button (rebuilt by the repaint) to reclaim keyboard focus so keyboard users
+  // aren't dropped to <body> on a failed retry.
+  const wasRetrying=Boolean(_sessionListLoadError&&_sessionListLoadError.retrying);
   _sessionListLoadError={
     message:isTimeout
       ? 'Session list is taking longer than expected.'
@@ -4670,7 +4702,73 @@ function _showSessionListLoadError(error){
     detail:isTimeout
       ? 'The backend may still be scanning a very large session history.'
       : String(error&&error.message?error.message:''),
+    _retryFailedFocus:wasRetrying,
   };
+}
+
+function _renderSessionListLoadErrorNote(){
+  if(!_sessionListLoadError) return null;
+  const note=document.createElement('div');
+  note.className='session-list-error session-empty-note';
+  // a11y: announce load-error / retry-failure transitions to screen readers
+  // (the note is re-rendered on both the pending click and the failure repaint).
+  note.setAttribute('role','status');
+  note.setAttribute('aria-live','polite');
+  const title=document.createElement('div');
+  title.textContent=_sessionListLoadError.message||'Could not load conversations.';
+  note.appendChild(title);
+  if(_sessionListLoadError.detail){
+    const detail=document.createElement('div');
+    detail.className='session-list-error-detail';
+    detail.textContent=_sessionListLoadError.detail;
+    note.appendChild(detail);
+  }
+  const retry=document.createElement('button');
+  retry.type='button';
+  retry.className='session-list-error-retry';
+  const retrying=Boolean(_sessionListLoadError.retrying);
+  // Use aria-disabled (not the disabled property) for the pending state so the
+  // button can keep keyboard focus across the sidebar rebuild; the click/keydown
+  // guards below make it inert while busy.
+  const setPending=()=>{
+    retry.textContent='Retrying…';
+    retry.setAttribute('aria-disabled','true');
+    retry.setAttribute('aria-busy','true');
+    retry.onclick=null;
+  };
+  const bindRetry=()=>{
+    retry.onclick=(e)=>{
+      e.stopPropagation();
+      if(!_sessionListLoadError||_sessionListLoadError.retrying) return;
+      if(retry.getAttribute('aria-disabled')==='true') return;
+      setPending();
+      _sessionListLoadError={..._sessionListLoadError,retrying:true};
+      renderSessionListFromCache();
+      void renderSessionList({deferWhileInteracting:false}).finally(()=>{
+        if(!retry.parentNode||(_sessionListLoadError&&_sessionListLoadError.retrying)) return;
+        retry.textContent='Retry';
+        retry.removeAttribute('aria-disabled');
+        retry.removeAttribute('aria-busy');
+        bindRetry();
+      });
+    };
+  };
+  if(retrying){
+    setPending();
+  }else{
+    retry.textContent='Retry';
+    retry.removeAttribute('aria-disabled');
+    bindRetry();
+    // On a failure repaint that replaces a pending button, restore keyboard
+    // focus to the fresh Retry button so keyboard users aren't dropped to body.
+    if(_sessionListLoadError._retryFailedFocus){
+      delete _sessionListLoadError._retryFailedFocus;
+      const _refocus=()=>{ try{ if(typeof retry.focus==='function') retry.focus(); }catch(_e){} };
+      if(typeof requestAnimationFrame==='function') requestAnimationFrame(_refocus); else _refocus();
+    }
+  }
+  note.appendChild(retry);
+  return note;
 }
 
 async function _runRenderSessionListRefresh(opts, _gen){
@@ -4821,6 +4919,7 @@ let _activeSessionExternalRefreshInFlight = false;
 let _deferredActiveSessionExternalRefreshReason = '';
 let _sessionEventsSSE = null;
 let _sessionEventsRefreshTimer = 0;
+let _sessionEventsRefreshPendingRequest = null;
 let _sessionEventsReconnectTimer = 0;
 let _sessionEventsNeedsRefreshOnOpen = false;
 let _sessionEventsReconnectAttempt = 0;
@@ -4834,7 +4933,20 @@ function _sessionEventsReconnectDelayMs(){
   return Math.min(_sessionEventsReconnectMaxMs, Math.floor(base * 0.75) + jitter);
 }
 let _sessionListRefreshInFlight = false;
-let _sessionListRefreshPendingReason = '';
+let _sessionListRefreshPendingRequest = null;
+
+function _mergeSessionListRefreshOptions(prev, next){
+  const merged = {...(prev||{}), ...(next||{})};
+  if((prev&&prev.force===true)||(next&&next.force===true)) merged.force = true;
+  if((prev&&prev.refreshActive===true)||(next&&next.refreshActive===true)) merged.refreshActive = true;
+  return merged;
+}
+
+function _refreshSessionListAfterSidebarResume(reason){
+  // A direct resume refresh satisfies any pending onopen catch-up from the same close.
+  _sessionEventsNeedsRefreshOnOpen = false;
+  void refreshSessionList(reason, {force:true});
+}
 
 function startStreamingPoll(){
   if(_streamingPollTimer) return;
@@ -4984,6 +5096,11 @@ async function refreshActiveSessionIfExternallyUpdated(reason){
       // tradeoffs).
       const _recoveryReasons = {visible:true, focus:true};
       const _keepStaleUntilLoaded = !!_recoveryReasons[String(reason||'')];
+      // #5409: skip force-reload while a different session's loadSession()
+      // is in flight — avoids overwriting _loadingSessionId and silently
+      // cancelling an in-progress session switch. All four call paths
+      // (idle-reconcile, poll, visibility, focus) funnel through here.
+      if(typeof _loadingSessionId !== 'undefined' && _loadingSessionId && _loadingSessionId !== sid) return 'skipped';
       await loadSession(sid, {force:true, externalRefreshReason:reason||'poll', keepStaleUntilLoaded:_keepStaleUntilLoaded});
       if(typeof renderSessionList==='function') void renderSessionList();
       return 'reloaded';
@@ -5025,7 +5142,10 @@ async function refreshSessionList(reason='manual', opts={}){
   const refreshActive = !!(opts && opts.refreshActive);
   if(!force && typeof document !== 'undefined' && document.hidden) return;
   if(_sessionListRefreshInFlight){
-    _sessionListRefreshPendingReason = reason || 'session-list';
+    _sessionListRefreshPendingRequest = {
+      reason: reason || 'session-list',
+      opts:_mergeSessionListRefreshOptions(_sessionListRefreshPendingRequest && _sessionListRefreshPendingRequest.opts, opts),
+    };
     return;
   }
   _sessionListRefreshInFlight = true;
@@ -5034,17 +5154,23 @@ async function refreshSessionList(reason='manual', opts={}){
     if(refreshActive) await refreshActiveSessionIfExternallyUpdated(reason||'session-list');
   }finally{
     _sessionListRefreshInFlight = false;
-    const pendingReason = _sessionListRefreshPendingReason;
-    _sessionListRefreshPendingReason = '';
-    if(pendingReason) _scheduleSessionEventsRefresh(pendingReason);
+    const pendingRequest = _sessionListRefreshPendingRequest;
+    _sessionListRefreshPendingRequest = null;
+    if(pendingRequest) _scheduleSessionEventsRefresh(pendingRequest.reason, pendingRequest.opts);
   }
 }
 
-function _scheduleSessionEventsRefresh(reason){
+function _scheduleSessionEventsRefresh(reason, opts={}){
+  _sessionEventsRefreshPendingRequest = {
+    reason: reason || (_sessionEventsRefreshPendingRequest && _sessionEventsRefreshPendingRequest.reason) || 'event',
+    opts:_mergeSessionListRefreshOptions(_sessionEventsRefreshPendingRequest && _sessionEventsRefreshPendingRequest.opts, opts),
+  };
   if(_sessionEventsRefreshTimer) return;
   _sessionEventsRefreshTimer = setTimeout(() => {
     _sessionEventsRefreshTimer = 0;
-    void refreshSessionList(reason||'event', {refreshActive:true});
+    const request = _sessionEventsRefreshPendingRequest || {reason:'event', opts:{}};
+    _sessionEventsRefreshPendingRequest = null;
+    void refreshSessionList(request.reason||'event', request.opts);
   }, 300);
 }
 
@@ -5113,7 +5239,7 @@ function _installSidebarSseFocusHook(){
     // to prevent, in the multi-window scenario this fix targets (#4151).
     ensureSessionEventsSSE();
     if(!_gatewaySSE) startGatewaySSE();
-    void refreshSessionList('focus');
+    void _refreshSessionListAfterSidebarResume('focus');
   });
 }
 
@@ -5121,6 +5247,7 @@ function _closeSessionEventsSSE(){
   if(_sessionEventsSSE){
     try{if(_sessionEventsSSE.readyState!==2)_sessionEventsSSE.close();}catch(_){ }
     _sessionEventsSSE = null;
+    _sessionEventsNeedsRefreshOnOpen = true;
   }
 }
 
@@ -5131,7 +5258,7 @@ function ensureSessionEventsSSE(){
         _closeSessionEventsSSE();
       }else{
         ensureSessionEventsSSE();
-        void refreshSessionList('visible');
+        void _refreshSessionListAfterSidebarResume('visible');
       }
     });
     document._hermesSessionEventsVisibilityHook = true;
@@ -5147,7 +5274,7 @@ function ensureSessionEventsSSE(){
       _sessionEventsReconnectAttempt = 0;
       if(!_sessionEventsNeedsRefreshOnOpen) return;
       _sessionEventsNeedsRefreshOnOpen = false;
-      void refreshSessionList('reconnect');
+      void _refreshSessionListAfterSidebarResume('reconnect');
     };
     _sessionEventsSSE.addEventListener('sessions_changed', (ev) => {
       const activeProfile = S.activeProfile || 'default';
@@ -5163,7 +5290,7 @@ function ensureSessionEventsSSE(){
         // Non-JSON payload (or transient malformed event). Keep legacy behavior:
         // refresh once event was seen.
       }
-      _scheduleSessionEventsRefresh(eventTargetsActiveSession?'event-active-session':'event');
+      _scheduleSessionEventsRefresh(eventTargetsActiveSession?'event-active-session':'event', {force:true, refreshActive:true});
     });
     _sessionEventsSSE.onerror = () => {
       _sessionEventsNeedsRefreshOnOpen = true;
@@ -5760,6 +5887,11 @@ function _sessionLineageContainsSession(s, sid){
   return false;
 }
 
+function _authoritativeLineageTipId(s){
+  if(!s) return null;
+  return s._lineage_tip_id||s._parent_lineage_tip_id||null;
+}
+
 function _resolveSessionIdFromSidebarLineage(sid){
   sid=String(sid||'').trim();
   if(!sid||!Array.isArray(_allSessions)||!_allSessions.length) return sid||null;
@@ -5839,7 +5971,11 @@ function _pruneLineageReportCacheToVisibleSessions(sessions){
 }
 
 function _lineageReportCacheKey(s,lineageKey){
-  return lineageKey||_sidebarLineageKeyForRow(s)||null;
+  const key=lineageKey||_sidebarLineageKeyForRow(s)||null;
+  const tip=typeof _authoritativeLineageTipId==='function'
+    ? _authoritativeLineageTipId(s)
+    : s&&(s._lineage_tip_id||s._parent_lineage_tip_id)||null;
+  return key&&tip&&tip!==key?`${key}::${tip}`:key;
 }
 
 function _lineageLocalSegmentCount(s){
@@ -5851,11 +5987,21 @@ function _lineageLocalSegmentCount(s){
 function _lineageReportNeedsFetch(s,lineageKey,segmentCount){
   const key=_lineageReportCacheKey(s,lineageKey);
   if(!s||!s.session_id||!key) return false;
-  if(_lineageReportCache.has(key)||_lineageReportInflight.has(key)) return false;
+  const cached=_lineageReportCache.get(key);
+  const expectedCount=Number(segmentCount||0);
+  if(cached){
+    const cachedCount=Array.isArray(cached.segments)?cached.segments.length:0;
+    if(!cached.error&&expectedCount>0&&cachedCount>0&&cachedCount!==expectedCount){
+      _lineageReportCache.delete(key);
+    } else {
+      return false;
+    }
+  }
+  if(_lineageReportInflight.has(key)) return false;
   return Number(segmentCount||0)>_lineageLocalSegmentCount(s);
 }
 
-function _lineageSegmentsForRender(s,lineageKey){
+function _lineageSegmentsForRender(s,lineageKey,skipCached){
   const segments=[];
   const seen=new Set();
   const currentSid=s&&s.session_id;
@@ -5866,9 +6012,11 @@ function _lineageSegmentsForRender(s,lineageKey){
     segments.push({...seg});
   };
   for(const seg of (Array.isArray(s&&s._lineage_segments)?s._lineage_segments:[])) addSegment(seg);
-  const cached=_lineageReportCache.get(_lineageReportCacheKey(s,lineageKey));
-  if(cached&&Array.isArray(cached.segments)){
-    for(const seg of cached.segments) addSegment(seg);
+  if(!skipCached){
+    const cached=_lineageReportCache.get(_lineageReportCacheKey(s,lineageKey));
+    if(cached&&Array.isArray(cached.segments)){
+      for(const seg of cached.segments) addSegment(seg);
+    }
   }
   return segments;
 }
@@ -6075,6 +6223,9 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
       parentRow=resolved.row;
       parentSegment=resolved.seg;
     }
+    if(!parentRow&&child._parent_lineage_tip_id){
+      parentRow=visibleBySid.get(child._parent_lineage_tip_id)||null;
+    }
     if(!parentRow&&child._parent_lineage_root_id){
       parentRow=visibleByLineageKey.get(child._parent_lineage_root_id)||null;
     }
@@ -6179,7 +6330,10 @@ function _collapseSessionLineageForSidebar(sessions){
       if(bSnapshot!==aSnapshot) return aSnapshot-bSnapshot;
       return _sessionTimestampMs(b)-_sessionTimestampMs(a);
     });
-    const chosen=sorted[0];
+    const tipIds=new Set(items.map(item=>typeof _authoritativeLineageTipId==='function'
+      ? _authoritativeLineageTipId(item)
+      : item&&(item._lineage_tip_id||item._parent_lineage_tip_id)||null).filter(Boolean));
+    const chosen=sorted.find(item=>tipIds.has(item&&item.session_id))||sorted[0];
     result.push({...chosen,_lineage_key:key,_lineage_collapsed_count:items.length,_lineage_segments:sorted});
   }
   return result;
@@ -6685,23 +6839,8 @@ function renderSessionListFromCache(){
   if(_sessionSelectMode&&_selectedSessions.size>0){batchBar.style.display='flex';_renderBatchActionBar();}
   else{batchBar.style.display='none';}
   if(_sessionListLoadError){
-    const note=document.createElement('div');
-    note.className='session-list-error session-empty-note';
-    const title=document.createElement('div');
-    title.textContent=_sessionListLoadError.message||'Could not load conversations.';
-    note.appendChild(title);
-    if(_sessionListLoadError.detail){
-      const detail=document.createElement('div');
-      detail.className='session-list-error-detail';
-      detail.textContent=_sessionListLoadError.detail;
-      note.appendChild(detail);
-    }
-    const retry=document.createElement('button');
-    retry.type='button';
-    retry.textContent='Retry';
-    retry.onclick=(e)=>{e.stopPropagation();_sessionListLoadError=null;void renderSessionList({deferWhileInteracting:false});};
-    note.appendChild(retry);
-    list.appendChild(note);
+    const note=_renderSessionListLoadErrorNote();
+    if(note) list.appendChild(note);
   }
   if(window._showCliSessions || cliSessionCount>0){
     const sourceTabs=document.createElement('div');
@@ -7142,8 +7281,8 @@ function renderSessionListFromCache(){
     const showLineageMetadata=density==='detailed';
     const lineageKey=_sidebarLineageKeyForRow(s);
     const segmentCount=showLineageMetadata?_sessionSegmentCount(s):0;
-    const lineageSegments=showLineageMetadata?_lineageSegmentsForRender(s,lineageKey):[];
     const needsLineageReport=showLineageMetadata?_lineageReportNeedsFetch(s,lineageKey,segmentCount):false;
+    const lineageSegments=showLineageMetadata?_lineageSegmentsForRender(s,lineageKey,needsLineageReport):[];
     const lineageReportKey=showLineageMetadata?_lineageReportCacheKey(s,lineageKey):null;
     const canExpandLineageSegments=showLineageMetadata&&Boolean(lineageKey&&segmentCount>1&&(lineageSegments.length>0||needsLineageReport||_lineageReportInflight.has(lineageReportKey)));
     const lineageSegmentsExpanded=canExpandLineageSegments&&_expandedLineageKeys.has(lineageKey);
@@ -7247,6 +7386,8 @@ function renderSessionListFromCache(){
         row.title=t('session_lineage_segment_open');
         row.onclick=async(e)=>{
           e.stopPropagation();
+          // #5409: close mobile sidebar synchronously before navigation
+          if(typeof closeMobileSidebar==='function')closeMobileSidebar();
           await _openSidebarSession(seg, {skipLineageResolve:true});
         };
         lineageList.appendChild(row);
@@ -7259,6 +7400,8 @@ function renderSessionListFromCache(){
       ['pointerdown','pointerup','click','touchstart','touchmove','touchend','touchcancel'].forEach(ev=>childList.addEventListener(ev,e=>e.stopPropagation()));
       const sortedChildren=[...s._child_sessions].sort((a,b)=>_sessionTimestampMs(b)-_sessionTimestampMs(a));
       const openChildSession=async(childSession)=>{
+        // #5409: close mobile sidebar synchronously before navigation
+        if(typeof closeMobileSidebar==='function')closeMobileSidebar();
         await _openSidebarSession(childSession, {skipLineageResolve:true});
       };
       const childLabelFor=(child)=>{
@@ -7884,8 +8027,12 @@ function renderSessionListFromCache(){
         if(_renamingSid) return;
         try{
           if(($('sessionSearch').value||'').trim()) _hideSearchPreviewsAfterSelect=true;
-          await _openSidebarSession(s);
+          // #5409: close mobile sidebar synchronously BEFORE awaiting _openSidebarSession
+          // so the user gets instant feedback that navigation is happening, even
+          // for large sessions where loadSession can take 3-15s (metadata fetch +
+          // message load + renderMessages DOM build on slow iOS WKWebView).
           if(typeof closeMobileSidebar==='function')closeMobileSidebar();
+          await _openSidebarSession(s);
         }finally{
           el.classList.remove('loading');
         }
